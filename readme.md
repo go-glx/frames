@@ -9,7 +9,7 @@ and calculate all frame stats, also it will be throttle
 processing, when CPU is more powerful than we need in `targetFPS`
 
 After each frame, it call `afterFrame` function with all
-frame stats. And most useful is frame `stats.DeltaTime`
+frame stats, and most useful is frame `stats.DeltaTime`
 
 ```go
 
@@ -28,7 +28,7 @@ func gameLoop() error {
   // - events handle
   // - etc..
   
-  time.Sleep(time.Millisecond * 25)
+  time.Sleep(time.Millisecond * 25) // emulate work..
 
   return nil
 }
@@ -70,8 +70,9 @@ executor := NewExecutor(
   WithTask(
     NewTask(
       func() {
-        // try to run every 100ms
-        // but at least once in second guaranteed
+        // try to run every frame
+        // but not more often that once in 1s
+        // but at least once in 10 second guaranteed
         runtime.GC()
         runtime.Gosched()
       },
@@ -132,6 +133,10 @@ Test settings:
 - TestTime  = 3s
 - FPSLimit  = 24
 - LogicTime = 25ms (4 frame per 100ms / 40 frames per second)
+
+Tasks:
+- high priority 5ms task (run at least once in second, but try to every 500ms)
+- low priority GC (at least once in second, but try to every 100ms)
 
 Test output:
 ```
