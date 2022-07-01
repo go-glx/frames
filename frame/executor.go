@@ -2,36 +2,33 @@ package frame
 
 import (
 	"context"
-	"fmt"
 	"time"
+
+	"github.com/fe3dback/glx-frames/frame/internal/schedule"
 )
 
 const defaultLimitFPS = 60
 
 type (
 	Executor struct {
+		tasks            []*Task
 		logger           logger
 		frameErrBehavior ErrBehavior
 		limitFPS         int
 		limitDuration    time.Duration
 
 		// state
-		currentFrameID  uint64
-		executorStartAt time.Time
-		frameStartAt    time.Time
-		frameEndAt      time.Time
-		frameDuration   time.Duration
-		frameTimeLeft   time.Duration
-
-		// system
+		scheduler   *schedule.Scheduler
 		interrupted bool
 	}
 
-	mainFn = func() error
+	mainFn        = func() error
+	frameFinishFn = func(stats Stats)
 )
 
 func NewExecutor(initializers ...ExecutorInitializer) *Executor {
 	e := &Executor{
+		tasks:            []*Task{},
 		logger:           &fallbackLogger{},
 		frameErrBehavior: ErrBehaviorExit,
 		limitFPS:         defaultLimitFPS,
@@ -42,20 +39,41 @@ func NewExecutor(initializers ...ExecutorInitializer) *Executor {
 		init(e)
 	}
 
+	e.scheduler = schedule.NewScheduler(
+		schedule.NewPrioritize(func() time.Time {
+			return time.Now()
+		}),
+		transformTasks(e.tasks)...,
+	)
+
 	return e
 }
 
-func (e *Executor) Execute(ctx context.Context, fn mainFn) error {
+func (e *Executor) Execute(ctx context.Context, fn mainFn, frameFinish frameFinishFn) error {
 	e.listenForInterrupt(ctx)
-	e.executorStartAt = time.Now()
-	e.currentFrameID = 0
+
+	stats := Stats{
+		CurrentFrame:   0,
+		CurrentFPS:     e.limitFPS,
+		FrameTargetFPS: e.limitFPS,
+		FrameTimeLimit: e.limitDuration,
+		Execute: Timings{
+			StartAt: time.Now(),
+		},
+	}
+
+	collectFPSAt := time.Time{}
+	fps := 0
 
 	for !e.interrupted {
-		e.currentFrameID++
+		// prepare
+		stats.CurrentFrame++
+		stats.Frame.StartAt = time.Now()
 
-		e.frameStartAt = time.Now()
+		// run process
+		stats.Process.StartAt = time.Now()
 		err := fn()
-		e.frameEndAt = time.Now()
+		stats.Process.Duration = time.Since(stats.Process.StartAt)
 
 		if err != nil {
 			if next := e.handleError(err); next != nil {
@@ -63,13 +81,40 @@ func (e *Executor) Execute(ctx context.Context, fn mainFn) error {
 			}
 		}
 
-		e.frameDuration = e.frameEndAt.Sub(e.frameStartAt)
-		e.frameTimeLeft = e.limitDuration - e.frameDuration
+		// calculate timings
+		stats.FrameFreeTime = stats.FrameTimeLimit - stats.Process.Duration
 
-		// todo: run lazy tasks
-		// todo: run before/after events
-		// todo: calculate deltaTime
-		// todo: continue next
+		// run additional tasks, if we have free time
+		stats.Tasks.StartAt = time.Now()
+		if stats.FrameFreeTime > (time.Millisecond) {
+			e.scheduler.Execute(stats.FrameFreeTime)
+		}
+		stats.Tasks.Duration = time.Since(stats.Tasks.StartAt)
+
+		// throttle
+		totalSpend := stats.Process.Duration + stats.Tasks.Duration
+		stats.ThrottleTime = stats.FrameTimeLimit - totalSpend
+		stats.FramePossibleFPS = int(time.Second / totalSpend)
+		time.Sleep(stats.ThrottleTime)
+
+		// end frame
+		stats.Frame.Duration = time.Since(stats.Frame.StartAt)
+		stats.Execute.Duration = time.Since(stats.Execute.StartAt)
+
+		// calculate deltas
+		stats.DeltaTime = stats.Frame.Duration.Seconds()
+
+		// finish frame
+		frameFinish(stats)
+
+		// utils after frame processing
+		fps++
+
+		if collectFPSAt.After(time.Now()) {
+			collectFPSAt = time.Now().Add(time.Second)
+			stats.CurrentFPS = fps
+			fps = 0
+		}
 	}
 
 	return nil
@@ -85,8 +130,6 @@ func (e *Executor) listenForInterrupt(ctx context.Context) {
 }
 
 func (e *Executor) handleError(err error) error {
-	err = fmt.Errorf("error on %d frame: %w", e.currentFrameID, err)
-
 	if e.frameErrBehavior == ErrBehaviorExit {
 		return err
 	}

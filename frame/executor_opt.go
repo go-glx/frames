@@ -1,10 +1,18 @@
 package frame
 
-import "time"
+import (
+	"time"
+)
 
 type (
 	ExecutorInitializer = func(*Executor)
 )
+
+func WithTask(task *Task) ExecutorInitializer {
+	return func(e *Executor) {
+		e.tasks = append(e.tasks, task)
+	}
+}
 
 func WithFrameErrorHandleBehavior(behavior ErrBehavior) ExecutorInitializer {
 	return func(e *Executor) {
