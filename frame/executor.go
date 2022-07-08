@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/fe3dback/glx-frames/frame/internal/schedule"
+	"github.com/go-glx/frames/frame/internal/schedule"
 )
 
 const defaultLimitFPS = 60

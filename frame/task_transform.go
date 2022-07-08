@@ -1,6 +1,6 @@
 package frame
 
-import "github.com/fe3dback/glx-frames/frame/internal/schedule"
+import "github.com/go-glx/frames/frame/internal/schedule"
 
 func transformTasks(tasks []*Task) []*schedule.Task {
 	innerTasks := make([]*schedule.Task, 0, len(tasks))

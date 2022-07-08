@@ -1,4 +1,4 @@
-# glx-frames
+# go-glx / frames
 
 Library for making endless game-loops, it`s heart of any game engine.
 
