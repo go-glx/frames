@@ -22,8 +22,15 @@ func WithFrameErrorHandleBehavior(behavior ErrBehavior) ExecutorInitializer {
 
 func WithTargetFPS(targetFPS int) ExecutorInitializer {
 	return func(e *Executor) {
-		e.limitFPS = targetFPS
-		e.limitDuration = time.Second / time.Duration(targetFPS)
+		e.framePS = targetFPS
+		e.frameDuration = time.Second / time.Duration(targetFPS)
+	}
+}
+
+func WithTargetTPS(targetTPS int) ExecutorInitializer {
+	return func(e *Executor) {
+		e.ratePS = targetTPS
+		e.rateDuration = time.Second / time.Duration(targetTPS)
 	}
 }
 

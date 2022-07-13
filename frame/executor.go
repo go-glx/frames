@@ -2,27 +2,37 @@ package frame
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/go-glx/frames/frame/internal/schedule"
 )
 
 const defaultLimitFPS = 60
+const defaultTPS = 50
 
 type (
 	Executor struct {
 		tasks            []*Task
 		logger           logger
 		frameErrBehavior ErrBehavior
-		limitFPS         int
-		limitDuration    time.Duration
+		framePS          int           // target FPS
+		frameDuration    time.Duration // 1s/FPS
+		ratePS           int           // physic/static updates per seconds (TPS, or ticks per second)
+		rateDuration     time.Duration // ticks interval
 
 		// state
+		lastSyncAt  time.Time
+		realFPS     int
+		realTPS     int
+		stats       Stats
 		scheduler   *schedule.Scheduler
 		interrupted bool
+
+		mux sync.Mutex
 	}
 
-	mainFn        = func() error
+	updateFn      = func() error
 	frameFinishFn = func(stats Stats)
 )
 
@@ -31,8 +41,10 @@ func NewExecutor(initializers ...ExecutorInitializer) *Executor {
 		tasks:            []*Task{},
 		logger:           &fallbackLogger{},
 		frameErrBehavior: ErrBehaviorExit,
-		limitFPS:         defaultLimitFPS,
-		limitDuration:    time.Second / time.Duration(defaultLimitFPS),
+		framePS:          defaultLimitFPS,
+		frameDuration:    time.Second / time.Duration(defaultLimitFPS),
+		ratePS:           defaultTPS,
+		rateDuration:     time.Second / time.Duration(defaultTPS),
 	}
 
 	for _, init := range initializers {
@@ -46,87 +58,181 @@ func NewExecutor(initializers ...ExecutorInitializer) *Executor {
 		transformTasks(e.tasks)...,
 	)
 
-	return e
-}
-
-func (e *Executor) Execute(ctx context.Context, fn mainFn, frameFinish frameFinishFn) error {
-	e.listenForInterrupt(ctx)
-
-	stats := Stats{
+	e.stats = Stats{
 		CurrentFrame:   0,
-		CurrentFPS:     e.limitFPS,
-		FrameTargetFPS: e.limitFPS,
-		FrameTimeLimit: e.limitDuration,
+		CurrentTPS:     e.ratePS,
+		FrameTargetTPS: e.ratePS,
+		CurrentFPS:     e.framePS,
+		FrameTargetFPS: e.framePS,
+		FrameTimeLimit: e.frameDuration,
 		Execute: Timings{
 			StartAt: time.Now(),
 		},
 	}
 
-	collectFPSAt := time.Time{}
-	fps := 0
+	return e
+}
 
+func (e *Executor) Execute(ctx context.Context, mainUpdate updateFn, fixedUpdate updateFn, frameFinish frameFinishFn) error {
+	errChan := make(chan error, 1)
+
+	go e.calculatePerformance()
+	go e.frameUpdate(mainUpdate, frameFinish, errChan)
+	go e.fixedUpdate(fixedUpdate, errChan)
+
+	select {
+	case err := <-errChan:
+		e.interrupted = true
+		return err
+	case <-ctx.Done():
+		e.interrupted = true
+		return nil
+	}
+}
+
+func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, errChannel chan<- error) {
+	penaltyTime := time.Millisecond * 0
+	e.lastSyncAt = time.Now()
 	for !e.interrupted {
+		// ------------------------------
+		e.mux.Lock()
+		// ------------------------------
+
 		// prepare
-		stats.CurrentFrame++
-		stats.Frame.StartAt = time.Now()
+		e.stats.CurrentFrame++
+		e.stats.Frame.StartAt = time.Now()
+		e.stats.Fixed.Duration = 0
 
 		// run process
-		stats.Process.StartAt = time.Now()
-		err := fn()
-		stats.Process.Duration = time.Since(stats.Process.StartAt)
+		e.stats.Process.StartAt = time.Now()
+		err := mainUpdate()
+		e.stats.Process.Duration = time.Since(e.stats.Process.StartAt)
 
 		if err != nil {
 			if next := e.handleError(err); next != nil {
-				return next
+				errChannel <- next
+				break
 			}
 		}
 
 		// calculate timings
-		stats.FrameFreeTime = stats.FrameTimeLimit - stats.Process.Duration
+		e.stats.FrameFreeTime = e.stats.FrameTimeLimit - e.stats.Process.Duration - e.stats.Fixed.Duration
 
 		// run additional tasks, if we have free time
-		stats.Tasks.StartAt = time.Now()
-		if stats.FrameFreeTime > (time.Millisecond) {
-			e.scheduler.Execute(stats.FrameFreeTime)
-		}
-		stats.Tasks.Duration = time.Since(stats.Tasks.StartAt)
+		e.stats.Tasks.StartAt = time.Now()
+		e.scheduler.Execute(e.stats.FrameFreeTime)
+		e.stats.Tasks.Duration = time.Since(e.stats.Tasks.StartAt)
 
-		// throttle
-		totalSpend := stats.Process.Duration + stats.Tasks.Duration
-		stats.ThrottleTime = stats.FrameTimeLimit - totalSpend
-		stats.FramePossibleFPS = int(time.Second / totalSpend)
-		time.Sleep(stats.ThrottleTime)
+		// calculate throttle
+		totalSpend := e.stats.Process.Duration + e.stats.Tasks.Duration
+		fixedUpdateSpent := e.stats.Fixed.Duration
+		expectedThrottleTime := e.stats.FrameTimeLimit - totalSpend - penaltyTime
+		e.stats.FramePossibleFPS = int(time.Second / totalSpend)
+
+		// unlock game loop, next we just wait for next frame
+		// and give time for other goroutines to work (fixed update, stats)
+		// ------------------------------
+		e.mux.Unlock()
+		// ------------------------------
+
+		throttleStart := time.Now()
+		sleepTimeLeft := expectedThrottleTime
+
+		// mini throttle sleep loop, we wait to spend all free time
+		// and give chance to execute other threads (fixed update)
+		for sleepTimeLeft > 0 {
+			e.mux.Lock()
+			// correct free time by fixed update from last check
+			if fixedUpdateSpent != e.stats.Fixed.Duration {
+				fixedUpdateSpent = e.stats.Fixed.Duration
+				sleepTimeLeft -= e.stats.Fixed.Duration
+			}
+			e.mux.Unlock()
+
+			// if fixed update eat all free time, just exit
+			if sleepTimeLeft <= 0 {
+				break
+			}
+
+			// if free time <1ms, sleep for remaining and exit
+			if sleepTimeLeft < time.Millisecond {
+				time.Sleep(sleepTimeLeft)
+				break
+			}
+
+			// ok, wait for next sync in 1ms
+			time.Sleep(time.Millisecond)
+			sleepTimeLeft -= time.Millisecond
+		}
+
+		e.stats.ThrottleTime = time.Since(throttleStart)
+		penaltyTime = e.stats.ThrottleTime - expectedThrottleTime
+		if penaltyTime < 0 {
+			penaltyTime = 0
+		}
+
+		// ------------------------------
+		e.mux.Lock()
+		// ------------------------------
 
 		// end frame
-		stats.Frame.Duration = time.Since(stats.Frame.StartAt)
-		stats.Execute.Duration = time.Since(stats.Execute.StartAt)
+		e.stats.Frame.Duration = time.Since(e.stats.Frame.StartAt)
+		e.stats.Execute.Duration = time.Since(e.stats.Execute.StartAt)
 
 		// calculate deltas
-		stats.DeltaTime = stats.Frame.Duration.Seconds()
+		e.stats.DeltaTime = time.Since(e.lastSyncAt).Seconds()
+		e.lastSyncAt = time.Now()
+		e.realFPS++
 
 		// finish frame
-		frameFinish(stats)
+		frameFinish(e.stats)
 
-		// utils after frame processing
-		fps++
-
-		if collectFPSAt.After(time.Now()) {
-			collectFPSAt = time.Now().Add(time.Second)
-			stats.CurrentFPS = fps
-			fps = 0
-		}
+		// ------------------------------
+		e.mux.Unlock()
+		// ------------------------------
 	}
-
-	return nil
 }
 
-func (e *Executor) listenForInterrupt(ctx context.Context) {
-	e.interrupted = false
+func (e *Executor) fixedUpdate(fixedUpdate updateFn, errChannel chan<- error) {
+	updateInterval := time.NewTicker(e.rateDuration)
+	defer updateInterval.Stop()
 
-	go func() {
-		<-ctx.Done()
-		e.interrupted = true
-	}()
+fixedUpdate:
+	for !e.interrupted {
+		select {
+		case <-updateInterval.C:
+			e.mux.Lock()
+
+			e.stats.Fixed.StartAt = time.Now()
+			err := fixedUpdate()
+			if err != nil {
+				if next := e.handleError(err); next != nil {
+					errChannel <- next
+					break fixedUpdate
+				}
+			}
+			e.realTPS++
+			e.stats.Fixed.Duration += time.Since(e.stats.Fixed.StartAt)
+
+			e.mux.Unlock()
+		}
+	}
+}
+
+func (e *Executor) calculatePerformance() {
+	for !e.interrupted {
+		select {
+		case <-time.After(time.Second):
+			e.mux.Lock()
+
+			e.stats.CurrentFPS = e.realFPS
+			e.stats.CurrentTPS = e.realTPS
+			e.realFPS = 0
+			e.realTPS = 0
+
+			e.mux.Unlock()
+		}
+	}
 }
 
 func (e *Executor) handleError(err error) error {
