@@ -14,8 +14,8 @@ func TestExecutor_Execute(t *testing.T) {
 	const testTime = time.Second * 3
 	const frameRate = 24
 	const ticksRate = 6
-	const frameTimeAvg = time.Millisecond * 4 // 4 frame per 100ms / 40 frames per second
-	const tickTimeAvg = time.Millisecond * 10 // 10 frame per 100ms / 100 frames per second
+	const frameTimeAvg = time.Millisecond * 25 // 4 frame per 100ms / 40 frames per second
+	const tickTimeAvg = time.Millisecond * 10  // 10 frame per 100ms / 100 frames per second
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTime)
 	defer cancel()
