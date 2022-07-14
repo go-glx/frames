@@ -78,7 +78,10 @@ func (e *Executor) Execute(ctx context.Context, mainUpdate updateFn, fixedUpdate
 
 	go e.calculatePerformance()
 	go e.frameUpdate(mainUpdate, frameFinish, errChan)
-	go e.fixedUpdate(fixedUpdate, errChan)
+
+	if e.ratePS > 0 {
+		go e.fixedUpdate(fixedUpdate, errChan)
+	}
 
 	select {
 	case err := <-errChan:
@@ -91,13 +94,12 @@ func (e *Executor) Execute(ctx context.Context, mainUpdate updateFn, fixedUpdate
 }
 
 func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, errChannel chan<- error) {
-	penaltyTime := time.Millisecond * 0
 	e.lastSyncAt = time.Now()
+
 	for !e.interrupted {
 		// ------------------------------
 		e.mux.Lock()
 		// ------------------------------
-
 		// prepare
 		e.stats.CurrentFrame++
 		e.stats.Frame.StartAt = time.Now()
@@ -124,56 +126,9 @@ func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, e
 		e.stats.Tasks.Duration = time.Since(e.stats.Tasks.StartAt)
 
 		// calculate throttle
-		totalSpend := e.stats.Process.Duration + e.stats.Tasks.Duration
-		fixedUpdateSpent := e.stats.Fixed.Duration
-		expectedThrottleTime := e.stats.FrameTimeLimit - totalSpend - penaltyTime
+		totalSpend := e.stats.Process.Duration + e.stats.Fixed.Duration + e.stats.Tasks.Duration
+		e.stats.ThrottleTime = e.stats.FrameTimeLimit - totalSpend
 		e.stats.FramePossibleFPS = int(time.Second / totalSpend)
-
-		// unlock game loop, next we just wait for next frame
-		// and give time for other goroutines to work (fixed update, stats)
-		// ------------------------------
-		e.mux.Unlock()
-		// ------------------------------
-
-		throttleStart := time.Now()
-		sleepTimeLeft := expectedThrottleTime
-
-		// mini throttle sleep loop, we wait to spend all free time
-		// and give chance to execute other threads (fixed update)
-		for sleepTimeLeft > 0 {
-			e.mux.Lock()
-			// correct free time by fixed update from last check
-			if fixedUpdateSpent != e.stats.Fixed.Duration {
-				fixedUpdateSpent = e.stats.Fixed.Duration
-				sleepTimeLeft -= e.stats.Fixed.Duration
-			}
-			e.mux.Unlock()
-
-			// if fixed update eat all free time, just exit
-			if sleepTimeLeft <= 0 {
-				break
-			}
-
-			// if free time <1ms, sleep for remaining and exit
-			if sleepTimeLeft < time.Millisecond {
-				time.Sleep(sleepTimeLeft)
-				break
-			}
-
-			// ok, wait for next sync in 1ms
-			time.Sleep(time.Millisecond)
-			sleepTimeLeft -= time.Millisecond
-		}
-
-		e.stats.ThrottleTime = time.Since(throttleStart)
-		penaltyTime = e.stats.ThrottleTime - expectedThrottleTime
-		if penaltyTime < 0 {
-			penaltyTime = 0
-		}
-
-		// ------------------------------
-		e.mux.Lock()
-		// ------------------------------
 
 		// end frame
 		e.stats.Frame.Duration = time.Since(e.stats.Frame.StartAt)
@@ -187,9 +142,53 @@ func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, e
 		// finish frame
 		frameFinish(e.stats)
 
+		// unlock game loop, next we just wait for next frame
+		// and give time for other goroutines to work (fixed update, stats)
 		// ------------------------------
 		e.mux.Unlock()
 		// ------------------------------
+
+		if e.stats.ThrottleTime > 0 {
+			time.Sleep(e.stats.ThrottleTime)
+		}
+
+		// todo:
+
+		// throttleStart := time.Now()
+		// sleepTimeLeft := expectedThrottleTime
+		//
+		// // mini throttle sleep loop, we wait to spend all free time
+		// // and give chance to execute other threads (fixed update)
+		// for sleepTimeLeft > 0 {
+		// 	e.mux.Lock()
+		// 	// correct free time by fixed update from last check
+		// 	if fixedUpdateSpent != e.stats.Fixed.Duration {
+		// 		fixedUpdateSpent = e.stats.Fixed.Duration
+		// 		sleepTimeLeft -= e.stats.Fixed.Duration
+		// 	}
+		// 	e.mux.Unlock()
+		//
+		// 	// if fixed update eat all free time, just exit
+		// 	if sleepTimeLeft <= 0 {
+		// 		break
+		// 	}
+		//
+		// 	// if free time <1ms, sleep for remaining and exit
+		// 	if sleepTimeLeft < time.Millisecond {
+		// 		time.Sleep(sleepTimeLeft)
+		// 		break
+		// 	}
+		//
+		// 	// ok, wait for next sync in 1ms
+		// 	time.Sleep(time.Millisecond)
+		// 	sleepTimeLeft -= time.Millisecond
+		// }
+		//
+		// e.stats.ThrottleTime = time.Since(throttleStart)
+		// penaltyTime = e.stats.ThrottleTime - expectedThrottleTime
+		// if penaltyTime < 0 {
+		// 	penaltyTime = 0
+		// }
 	}
 }
 

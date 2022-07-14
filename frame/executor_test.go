@@ -11,7 +11,7 @@ import (
 )
 
 func TestExecutor_Execute(t *testing.T) {
-	const testTime = time.Second * 3
+	const testTime = time.Second * 1
 	const frameRate = 24
 	const ticksRate = 6
 	const frameTimeAvg = time.Millisecond * 25 // 4 frame per 100ms / 40 frames per second
