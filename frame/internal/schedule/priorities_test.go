@@ -12,9 +12,6 @@ func testMakeTime(sec int, ms int) time.Time {
 func Test_calculateTaskPriority(t *testing.T) {
 	currentTime := testMakeTime(10, 0)
 
-	type args struct {
-		task *Task
-	}
 	tests := []struct {
 		name        string
 		currentTime time.Time

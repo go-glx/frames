@@ -2,7 +2,6 @@ package frame
 
 import (
 	"fmt"
-	"time"
 )
 
 type (
@@ -21,27 +20,19 @@ func WithFrameErrorHandleBehavior(behavior ErrBehavior) ExecutorInitializer {
 	}
 }
 
-func WithTargetFPS(targetFPS int) ExecutorInitializer {
+func WithStatsCollector(collector fnCollect) ExecutorInitializer {
 	return func(e *Executor) {
-		if targetFPS <= 0 {
-			panic(fmt.Errorf("TargetFPS should be greater than zero"))
-		}
-
-		e.framePS = targetFPS
-		e.frameDuration = time.Second / time.Duration(targetFPS)
+		e.statsCollector = collector
 	}
 }
 
 func WithTargetTPS(targetTPS int) ExecutorInitializer {
 	return func(e *Executor) {
 		if targetTPS <= 0 {
-			e.ratePS = 0
-			e.rateDuration = 0
-			return
+			panic(fmt.Errorf("TargetTPS should be greater than zero"))
 		}
 
-		e.ratePS = targetTPS
-		e.rateDuration = time.Second / time.Duration(targetTPS)
+		e.targetTPS = targetTPS
 	}
 }
 

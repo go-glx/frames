@@ -3,37 +3,30 @@ package frame
 import (
 	"context"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/go-glx/frames/frame/internal/schedule"
 )
 
-const defaultLimitFPS = 60
-const defaultTPS = 50
+const defaultTPS = 60
 
 type (
 	Executor struct {
 		tasks            []*Task
 		logger           logger
 		frameErrBehavior ErrBehavior
-		framePS          int           // target FPS
-		frameDuration    time.Duration // 1s/FPS
-		ratePS           int           // physic/static updates per seconds (TPS, or ticks per second)
-		rateDuration     time.Duration // ticks interval
+		targetTPS        int
+		statsCollector   fnCollect
 
 		// state
-		realFPS     int
-		realTPS     int
-		stats       Stats
-		scheduler   *schedule.Scheduler
 		interrupted bool
-
-		mux sync.Mutex
+		scheduler   *schedule.Scheduler
+		stats       Stats
 	}
 
-	updateFn      = func() error
-	frameFinishFn = func(stats Stats)
+	fnCollect = func(stats Stats)
+	fnTick    = func(tickStats TickStats) error
+	fnDraw    = func() error
 )
 
 func NewExecutor(initializers ...ExecutorInitializer) *Executor {
@@ -41,10 +34,7 @@ func NewExecutor(initializers ...ExecutorInitializer) *Executor {
 		tasks:            []*Task{},
 		logger:           &fallbackLogger{},
 		frameErrBehavior: ErrBehaviorExit,
-		framePS:          defaultLimitFPS,
-		frameDuration:    time.Second / time.Duration(defaultLimitFPS),
-		ratePS:           defaultTPS,
-		rateDuration:     time.Second / time.Duration(defaultTPS),
+		targetTPS:        defaultTPS,
 	}
 
 	for _, init := range initializers {
@@ -58,157 +48,252 @@ func NewExecutor(initializers ...ExecutorInitializer) *Executor {
 		transformTasks(e.tasks)...,
 	)
 
-	e.stats = Stats{
-		CurrentFrame:   0,
-		CurrentTPS:     e.ratePS,
-		FrameTargetTPS: e.ratePS,
-		CurrentFPS:     e.framePS,
-		FrameTargetFPS: e.framePS,
-		FrameTimeLimit: e.frameDuration,
-		Execute: Timings{
-			StartAt: time.Now(),
-		},
-	}
-
 	return e
 }
 
-func (e *Executor) Execute(ctx context.Context, mainUpdate updateFn, fixedUpdate updateFn, frameFinish frameFinishFn) error {
-	errChan := make(chan error, 1)
-
-	go e.calculatePerformance()
-	go e.frameUpdate(mainUpdate, frameFinish, errChan)
-
-	if e.ratePS > 0 {
-		go e.fixedUpdate(fixedUpdate, errChan)
-	}
-
-	select {
-	case err := <-errChan:
+func (e *Executor) Execute(ctx context.Context, updateFn fnTick, drawFn fnDraw) error {
+	// handle cancel
+	go func() {
+		<-ctx.Done()
 		e.interrupted = true
-		return err
-	case <-ctx.Done():
-		e.interrupted = true
-		return nil
-	}
-}
+	}()
 
-func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, errChannel chan<- error) {
-	lastSyncAt := time.Now()
-	throttleCorrection := time.Millisecond * 0
+	// initialize loop state
+	e.stats.CycleID = 0
+	e.stats.TargetTPS = e.targetTPS
+	e.stats.Rate = time.Second / time.Duration(e.stats.TargetTPS)
+	e.stats.Game.Start = time.Now()
+	e.stats.CurrentTPS = e.stats.TargetTPS
+	e.stats.CurrentFPS = e.stats.TargetTPS
+
+	// private state
+	lastSyncAt := time.Now().Add(-e.stats.Rate)
+	throttleCorrection := time.Duration(0)
+	resetCountersAt := time.Now().Add(time.Second)
+	currentTPS := 0
+	currentFPS := 0
 
 	for !e.interrupted {
-		// ------------------------------
-		e.mux.Lock()
-		// ------------------------------
-		// prepare
-		e.stats.CurrentFrame++
-		e.stats.Frame.StartAt = time.Now()
-		e.stats.Fixed.Duration = 0
+		// Start
+		// -------------------------
+		e.stats.CycleID++
+		e.stats.Cycle.Start = time.Now()
+
+		deltaTime := e.stats.Cycle.Start.Sub(lastSyncAt)
+		lastSyncAt = lastSyncAt.Add(deltaTime)
 
 		// calculate throttle correction
-		idealStartAt := e.stats.Execute.StartAt.Add(
-			time.Duration(e.stats.CurrentFrame-1) * e.stats.FrameTimeLimit,
+		// this will snap loop cycles to Rate intervals
+		idealStartAt := e.stats.Game.Start.Add(
+			time.Duration(e.stats.CycleID-1) * e.stats.Rate,
 		)
 
-		diffFromIdeal := e.stats.Frame.StartAt.Sub(idealStartAt).Microseconds()
-		diffFromIdeal = int64(math.Mod(float64(diffFromIdeal), float64(e.stats.FrameTimeLimit.Microseconds())))
+		diffFromIdeal := e.stats.Cycle.Start.Sub(idealStartAt).Microseconds()
+		diffFromIdeal = int64(math.Mod(float64(diffFromIdeal), float64(e.stats.Rate.Microseconds())))
 		throttleCorrection = time.Duration(diffFromIdeal) * time.Microsecond
 
-		// run process
-		e.stats.Process.StartAt = time.Now()
-		err := mainUpdate()
-		e.stats.Process.Duration = time.Since(e.stats.Process.StartAt)
+		// Tick
+		// -------------------------
+		e.stats.Tick.Start = time.Now()
+		updateDelta := e.stats.Rate + deltaTime
+		requiredUpdate := true
 
+		for updateDelta > e.stats.Rate {
+			if requiredUpdate {
+				// this will guarantee one update call every cycle
+				// if deltaTime less that Rate,
+				// but we throttle each frame to all not used budget
+				// anyway, so not needed updates will not run
+				requiredUpdate = false
+				updateDelta -= e.stats.Rate
+			}
+
+			currentTPS++
+			err := updateFn(TickStats{
+				CycleID:   e.stats.CycleID,
+				DeltaTime: deltaTime.Seconds(),
+			})
+			if err != nil {
+				if nextErr := e.handleError(err); nextErr != nil {
+					return nextErr
+				}
+			}
+
+			updateDelta -= e.stats.Rate
+		}
+		e.stats.Tick.Duration = time.Since(e.stats.Tick.Start)
+
+		// Frame
+		// -------------------------
+		e.stats.Frame.Start = time.Now()
+		currentFPS++
+		err := drawFn()
 		if err != nil {
-			if next := e.handleError(err); next != nil {
-				errChannel <- next
-				break
+			if nextErr := e.handleError(err); nextErr != nil {
+				return nextErr
 			}
 		}
+		e.stats.Frame.Duration = time.Since(e.stats.Frame.Start)
 
-		// calculate timings
-		e.stats.FrameFreeTime = e.stats.FrameTimeLimit - e.stats.Process.Duration - e.stats.Fixed.Duration
+		// Tasks
+		// -------------------------
+		totalSpend := e.stats.Tick.Duration + e.stats.Frame.Duration
+		freeTime := e.stats.Rate - totalSpend
+		e.stats.PossibleFPS = int(time.Second / totalSpend)
 
-		// run additional tasks, if we have free time
-		e.stats.Tasks.StartAt = time.Now()
-		e.scheduler.Execute(e.stats.FrameFreeTime)
-		e.stats.Tasks.Duration = time.Since(e.stats.Tasks.StartAt)
+		e.stats.Tasks.Start = time.Now()
+		e.scheduler.Execute(freeTime)
+		e.stats.Tasks.Duration = time.Since(e.stats.Tasks.Start)
 
-		// calculate throttle
-		totalSpend := e.stats.Process.Duration + e.stats.Fixed.Duration + e.stats.Tasks.Duration
-		e.stats.ThrottleTime = e.stats.FrameTimeLimit - totalSpend
+		// Throttle
+		// -------------------------
+		timeTaken := 0 +
+			e.stats.Tick.Duration +
+			e.stats.Frame.Duration +
+			e.stats.Tasks.Duration
+
+		e.stats.ThrottleTime = e.stats.Rate - timeTaken
+
 		if throttleCorrection > 0 {
 			e.stats.ThrottleTime -= throttleCorrection
 		}
 
-		e.stats.FramePossibleFPS = int(time.Second / totalSpend)
+		if e.stats.ThrottleTime < 0 {
+			e.stats.ThrottleTime = 0
+		}
 
-		// end frame
-		e.stats.Frame.Duration = time.Since(e.stats.Frame.StartAt)
-		e.stats.Execute.Duration = time.Since(e.stats.Execute.StartAt)
+		time.Sleep(e.stats.ThrottleTime)
 
-		// calculate deltas
-		e.stats.DeltaTime = time.Since(lastSyncAt).Seconds()
-		lastSyncAt = time.Now()
-		e.realFPS++
+		// End
+		// -------------------------
+		e.stats.Cycle.Duration = time.Since(e.stats.Cycle.Start)
+		e.stats.Game.Duration = time.Since(e.stats.Game.Start)
 
-		// finish frame
-		frameFinish(e.stats)
+		if time.Now().After(resetCountersAt) {
+			resetCountersAt = time.Now().Add(time.Second)
+			e.stats.CurrentTPS = currentTPS
+			e.stats.CurrentFPS = currentFPS
+			currentTPS = 0
+			currentFPS = 0
+		}
 
-		// unlock game loop, next we just wait for next frame
-		// and give time for other goroutines to work (fixed update, stats)
-		// ------------------------------
-		e.mux.Unlock()
-		// ------------------------------
-
-		if e.stats.ThrottleTime > 0 {
-			time.Sleep(e.stats.ThrottleTime)
+		if e.statsCollector != nil {
+			e.statsCollector(e.stats)
 		}
 	}
+
+	return nil
 }
 
-func (e *Executor) fixedUpdate(fixedUpdate updateFn, errChannel chan<- error) {
-	updateInterval := time.NewTicker(e.rateDuration)
-	defer updateInterval.Stop()
+// func (e *Executor) frameUpdate(mainUpdate fnTick, frameFinish frameFinishFn, errChannel chan<- error) {
+// 	lastSyncAt := time.Now()
+//
+//
+// 	for !e.interrupted {
+// 		// ------------------------------
+// 		e.mux.Lock()
+// 		// ------------------------------
+// 		// prepare
+// 		e.deprecatedStats.CurrentFrame++
+// 		e.deprecatedStats.Frame.Start = time.Now()
+// 		e.deprecatedStats.Fixed.Duration = 0
+//
 
-fixedUpdate:
-	for !e.interrupted {
-		select {
-		case <-updateInterval.C:
-			e.mux.Lock()
-
-			e.stats.Fixed.StartAt = time.Now()
-			err := fixedUpdate()
-			if err != nil {
-				if next := e.handleError(err); next != nil {
-					errChannel <- next
-					break fixedUpdate
-				}
-			}
-			e.realTPS++
-			e.stats.Fixed.Duration += time.Since(e.stats.Fixed.StartAt)
-
-			e.mux.Unlock()
-		}
-	}
-}
-
-func (e *Executor) calculatePerformance() {
-	for !e.interrupted {
-		select {
-		case <-time.After(time.Second):
-			e.mux.Lock()
-
-			e.stats.CurrentFPS = e.realFPS
-			e.stats.CurrentTPS = e.realTPS
-			e.realFPS = 0
-			e.realTPS = 0
-
-			e.mux.Unlock()
-		}
-	}
-}
+//
+// 		// run process
+// 		e.deprecatedStats.Process.Start = time.Now()
+// 		err := mainUpdate()
+// 		e.deprecatedStats.Process.Duration = time.Since(e.deprecatedStats.Process.Start)
+//
+// 		if err != nil {
+// 			if next := e.handleError(err); next != nil {
+// 				errChannel <- next
+// 				break
+// 			}
+// 		}
+//
+// 		// calculate timings
+// 		e.deprecatedStats.FrameFreeTime = e.deprecatedStats.FrameTimeLimit - e.deprecatedStats.Process.Duration - e.deprecatedStats.Fixed.Duration
+//
+// 		// run additional tasks, if we have free time
+// 		e.deprecatedStats.Tasks.Start = time.Now()
+// 		e.scheduler.Execute(e.deprecatedStats.FrameFreeTime)
+// 		e.deprecatedStats.Tasks.Duration = time.Since(e.deprecatedStats.Tasks.Start)
+//
+// 		// calculate throttle
+// 		totalSpend := e.deprecatedStats.Process.Duration + e.deprecatedStats.Fixed.Duration + e.deprecatedStats.Tasks.Duration
+// 		e.deprecatedStats.ThrottleTime = e.deprecatedStats.FrameTimeLimit - totalSpend
+// 		if throttleCorrection > 0 {
+// 			e.deprecatedStats.ThrottleTime -= throttleCorrection
+// 		}
+//
+//
+//
+// 		// end frame
+// 		e.deprecatedStats.Frame.Duration = time.Since(e.deprecatedStats.Frame.Start)
+// 		e.deprecatedStats.Execute.Duration = time.Since(e.deprecatedStats.Execute.Start)
+//
+// 		// calculate deltas
+// 		e.deprecatedStats.DeltaTime = time.Since(lastSyncAt).Seconds()
+// 		lastSyncAt = time.Now()
+// 		e.realFPS++
+//
+// 		// finish frame
+// 		frameFinish(e.deprecatedStats)
+//
+// 		// unlock game loop, next we just wait for next frame
+// 		// and give time for other goroutines to work (fixed update, deprecatedStats)
+// 		// ------------------------------
+// 		e.mux.Unlock()
+// 		// ------------------------------
+//
+// 		if e.deprecatedStats.ThrottleTime > 0 {
+// 			time.Sleep(e.deprecatedStats.ThrottleTime)
+// 		}
+// 	}
+// }
+//
+// func (e *Executor) fixedUpdate(fixedUpdate fnTick, errChannel chan<- error) {
+// 	updateInterval := time.NewTicker(e.rateDuration)
+// 	defer updateInterval.Stop()
+//
+// fixedUpdate:
+// 	for !e.interrupted {
+// 		select {
+// 		case <-updateInterval.C:
+// 			e.mux.Lock()
+//
+// 			e.deprecatedStats.Fixed.Start = time.Now()
+// 			err := fixedUpdate()
+// 			if err != nil {
+// 				if next := e.handleError(err); next != nil {
+// 					errChannel <- next
+// 					break fixedUpdate
+// 				}
+// 			}
+// 			e.realTPS++
+// 			e.deprecatedStats.Fixed.Duration += time.Since(e.deprecatedStats.Fixed.Start)
+//
+// 			e.mux.Unlock()
+// 		}
+// 	}
+// }
+//
+// func (e *Executor) calculatePerformance() {
+// 	for !e.interrupted {
+// 		select {
+// 		case <-time.After(time.Second):
+// 			e.mux.Lock()
+//
+// 			e.deprecatedStats.CurrentFPS = e.realFPS
+// 			e.deprecatedStats.CurrentTPS = e.realTPS
+// 			e.realFPS = 0
+// 			e.realTPS = 0
+//
+// 			e.mux.Unlock()
+// 		}
+// 	}
+// }
 
 func (e *Executor) handleError(err error) error {
 	if e.frameErrBehavior == ErrBehaviorExit {
