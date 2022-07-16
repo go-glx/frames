@@ -2,6 +2,7 @@ package frame
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -22,7 +23,6 @@ type (
 		rateDuration     time.Duration // ticks interval
 
 		// state
-		lastSyncAt  time.Time
 		realFPS     int
 		realTPS     int
 		stats       Stats
@@ -94,7 +94,8 @@ func (e *Executor) Execute(ctx context.Context, mainUpdate updateFn, fixedUpdate
 }
 
 func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, errChannel chan<- error) {
-	e.lastSyncAt = time.Now()
+	lastSyncAt := time.Now()
+	throttleCorrection := time.Millisecond * 0
 
 	for !e.interrupted {
 		// ------------------------------
@@ -104,6 +105,15 @@ func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, e
 		e.stats.CurrentFrame++
 		e.stats.Frame.StartAt = time.Now()
 		e.stats.Fixed.Duration = 0
+
+		// calculate throttle correction
+		idealStartAt := e.stats.Execute.StartAt.Add(
+			time.Duration(e.stats.CurrentFrame-1) * e.stats.FrameTimeLimit,
+		)
+
+		diffFromIdeal := e.stats.Frame.StartAt.Sub(idealStartAt).Microseconds()
+		diffFromIdeal = int64(math.Mod(float64(diffFromIdeal), float64(e.stats.FrameTimeLimit.Microseconds())))
+		throttleCorrection = time.Duration(diffFromIdeal) * time.Microsecond
 
 		// run process
 		e.stats.Process.StartAt = time.Now()
@@ -128,6 +138,10 @@ func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, e
 		// calculate throttle
 		totalSpend := e.stats.Process.Duration + e.stats.Fixed.Duration + e.stats.Tasks.Duration
 		e.stats.ThrottleTime = e.stats.FrameTimeLimit - totalSpend
+		if throttleCorrection > 0 {
+			e.stats.ThrottleTime -= throttleCorrection
+		}
+
 		e.stats.FramePossibleFPS = int(time.Second / totalSpend)
 
 		// end frame
@@ -135,8 +149,8 @@ func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, e
 		e.stats.Execute.Duration = time.Since(e.stats.Execute.StartAt)
 
 		// calculate deltas
-		e.stats.DeltaTime = time.Since(e.lastSyncAt).Seconds()
-		e.lastSyncAt = time.Now()
+		e.stats.DeltaTime = time.Since(lastSyncAt).Seconds()
+		lastSyncAt = time.Now()
 		e.realFPS++
 
 		// finish frame
@@ -151,44 +165,6 @@ func (e *Executor) frameUpdate(mainUpdate updateFn, frameFinish frameFinishFn, e
 		if e.stats.ThrottleTime > 0 {
 			time.Sleep(e.stats.ThrottleTime)
 		}
-
-		// todo:
-
-		// throttleStart := time.Now()
-		// sleepTimeLeft := expectedThrottleTime
-		//
-		// // mini throttle sleep loop, we wait to spend all free time
-		// // and give chance to execute other threads (fixed update)
-		// for sleepTimeLeft > 0 {
-		// 	e.mux.Lock()
-		// 	// correct free time by fixed update from last check
-		// 	if fixedUpdateSpent != e.stats.Fixed.Duration {
-		// 		fixedUpdateSpent = e.stats.Fixed.Duration
-		// 		sleepTimeLeft -= e.stats.Fixed.Duration
-		// 	}
-		// 	e.mux.Unlock()
-		//
-		// 	// if fixed update eat all free time, just exit
-		// 	if sleepTimeLeft <= 0 {
-		// 		break
-		// 	}
-		//
-		// 	// if free time <1ms, sleep for remaining and exit
-		// 	if sleepTimeLeft < time.Millisecond {
-		// 		time.Sleep(sleepTimeLeft)
-		// 		break
-		// 	}
-		//
-		// 	// ok, wait for next sync in 1ms
-		// 	time.Sleep(time.Millisecond)
-		// 	sleepTimeLeft -= time.Millisecond
-		// }
-		//
-		// e.stats.ThrottleTime = time.Since(throttleStart)
-		// penaltyTime = e.stats.ThrottleTime - expectedThrottleTime
-		// if penaltyTime < 0 {
-		// 	penaltyTime = 0
-		// }
 	}
 }
 

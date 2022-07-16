@@ -30,9 +30,9 @@ type testMeasure struct {
 	endAt   time.Time
 }
 
-func waitMeasure(sleepTime time.Duration, bType testTraceBlockType) testMeasure {
+func testMeasureFunction(bType testTraceBlockType, fn func()) testMeasure {
 	start := time.Now()
-	time.Sleep(sleepTime)
+	fn()
 	end := time.Now()
 
 	return testMeasure{
@@ -44,25 +44,120 @@ func waitMeasure(sleepTime time.Duration, bType testTraceBlockType) testMeasure 
 
 type testTraceVariant struct {
 	outputName            string
+	outputDescriptionMd   string
 	testDuration          time.Duration
 	targetFramesPerSecond int
 	targetTicksPerSecond  int
 	latencyFrame          time.Duration
 	latencyTick           time.Duration
+
+	additionalLogicFrame func(frameID int)
+	additionalLogicTick  func(tickID int)
+	additionalTasks      []*Task
 }
 
 func testTraceVariants() []testTraceVariant {
 	return []testTraceVariant{
 		{
-			outputName:            "simple",
+			outputName: "1_30fps_60tps",
+			outputDescriptionMd: `
+				Example of stable deterministic fixed-step simulation.
+				- Target FPS (frames per second) = 30
+				- Target TPS (ticks per second) = 60
+				- Draw latency is 15ms
+				- Integration latency is 10ms
+			`,
 			testDuration:          time.Second * 1,
 			targetFramesPerSecond: 30,
-			targetTicksPerSecond:  0,
+			targetTicksPerSecond:  60,
 
-			// 33.3 shared budget
-			latencyFrame: time.Millisecond * 12,
-			latencyTick:  time.Millisecond * 0,
+			latencyFrame: time.Millisecond * 3,
+			latencyTick:  time.Millisecond * 6,
 		},
+		// {
+		// 	outputName: "2_30fps_task5ms",
+		// 	outputDescriptionMd: `
+		// 		Test have only frames logic:
+		// 		- every frame have 20ms latency.
+		// 		- frames from 1 to 10 - have additional 10ms latency
+		// 		- frame #3 will emulate super lag (+100ms latency)
+		//
+		// 		Additionally this configuration contains tasks:
+		// 		- #0: This test contains standard golang GC task
+		// 		- #1: Run at least once per 100ms, but at most one time in 50ms. Task will emulate 5ms of work
+		// 	`,
+		// 	testDuration:          time.Second * 1,
+		// 	targetFramesPerSecond: 30,
+		// 	targetTicksPerSecond:  0,
+		//
+		// 	// 33.3 shared budget
+		// 	latencyFrame: time.Millisecond * 20,
+		// 	latencyTick:  time.Millisecond * 0,
+		//
+		// 	additionalLogicFrame: func(frameID int) {
+		// 		if frameID == 3 {
+		// 			time.Sleep(time.Millisecond * 100)
+		// 		}
+		//
+		// 		if frameID < 10 {
+		// 			// emulate lag at 10 frame
+		// 			time.Sleep(time.Millisecond * 10)
+		// 		}
+		// 	},
+		//
+		// 	additionalTasks: []*Task{
+		// 		NewTask(func() {
+		// 			time.Sleep(time.Millisecond * 5)
+		// 		},
+		// 			WithRunAtLeastOnceIn(time.Millisecond*100),
+		// 			WithRunAtMostOnceIn(time.Millisecond*50),
+		// 			WithPriority(TaskPriorityHigh),
+		// 		),
+		// 	},
+		// },
+		// {
+		// 	outputName: "3_30fps_60tps",
+		// 	outputDescriptionMd: `
+		// 		Simple test with both systems active:
+		// 		- frames (FPS) with target at 120fps
+		// 		- ticks (TPS) with target at 30tps
+		//
+		// 		"Ticks" is fixed/physics/stable update in term of other game engines
+		// 		Ticks have more priority to run, and this will degrade frames performance
+		// 		when not have enough CPU power to process ticks
+		//
+		// 		Test rules:
+		// 		- avg latency on frame = 4ms
+		// 		- avg latency on tick = 2ms
+		// 		- frame 5..10 will emulate lag +5ms
+		// 		- tick 15..20 will emulate lag +5ms
+		// 		- all 25..30 will emulate full lag +5ms
+		// 	`,
+		// 	testDuration:          time.Second * 1,
+		// 	targetFramesPerSecond: 120,
+		// 	targetTicksPerSecond:  30,
+		//
+		// 	latencyFrame: time.Millisecond * 4,
+		// 	latencyTick:  time.Millisecond * 2,
+		//
+		// 	additionalLogicFrame: func(frameID int) {
+		// 		if frameID >= 5 && frameID <= 10 {
+		// 			time.Sleep(time.Millisecond * 5)
+		// 		}
+		// 		if frameID >= 25 && frameID <= 30 {
+		// 			time.Sleep(time.Millisecond * 5)
+		// 		}
+		// 	},
+		//
+		// 	additionalLogicTick: func(tickID int) {
+		// 		if tickID >= 15 && tickID <= 20 {
+		// 			time.Sleep(time.Millisecond * 5)
+		// 		}
+		// 		if tickID >= 25 && tickID <= 30 {
+		// 			time.Sleep(time.Millisecond * 5)
+		// 		}
+		// 	},
+		// },
 	}
 }
 
@@ -70,29 +165,49 @@ func TestTraceExecutor(t *testing.T) {
 	for _, variant := range testTraceVariants() {
 		ctx, cancel := context.WithTimeout(context.Background(), variant.testDuration)
 
-		testExecutor := NewExecutor(
-			WithTargetFPS(variant.targetFramesPerSecond),
-			WithTargetTPS(variant.targetTicksPerSecond),
-			WithTask(
-				NewDefaultTaskGarbageCollect(),
-			),
-		)
+		inits := make([]ExecutorInitializer, 0)
+		inits = append(inits, WithTargetFPS(variant.targetFramesPerSecond))
+		inits = append(inits, WithTargetTPS(variant.targetTicksPerSecond))
+		inits = append(inits, WithTask(NewDefaultTaskGarbageCollect()))
+
+		for _, task := range variant.additionalTasks {
+			inits = append(inits, WithTask(task))
+		}
+
+		testExecutor := NewExecutor(inits...)
 
 		collectedStats := make([]Stats, 0)
 		measures := make([]testMeasure, 0)
 
 		fnStats := func(s Stats) {
 			collectedStats = append(collectedStats, s)
-			measures = append(measures, waitMeasure(time.Millisecond*0, testTraceBlockSync))
+			measures = append(measures, testMeasureFunction(testTraceBlockSync, func() {}))
 		}
 
+		currentFrameID := 0
 		fnFrame := func() error {
-			measures = append(measures, waitMeasure(variant.latencyFrame, testTraceBlockFrame))
+			currentFrameID++
+			measures = append(measures, testMeasureFunction(testTraceBlockFrame, func() {
+				time.Sleep(variant.latencyFrame)
+
+				if variant.additionalLogicFrame != nil {
+					variant.additionalLogicFrame(currentFrameID)
+				}
+			}))
+
 			return nil
 		}
 
+		currentTickID := 0
 		fnTick := func() error {
-			measures = append(measures, waitMeasure(variant.latencyTick, testTraceBlockTick))
+			currentTickID++
+			measures = append(measures, testMeasureFunction(testTraceBlockTick, func() {
+				time.Sleep(variant.latencyTick)
+
+				if variant.additionalLogicTick != nil {
+					variant.additionalLogicTick(currentTickID)
+				}
+			}))
 			return nil
 		}
 
@@ -105,28 +220,35 @@ func TestTraceExecutor(t *testing.T) {
 	}
 }
 
-func testOutput(t *testing.T, e *Executor, variant testTraceVariant, measures []testMeasure, stats []Stats) {
+func testOutput(t *testing.T, _ *Executor, variant testTraceVariant, measures []testMeasure, stats []Stats) {
 	// colors
-	const colBack = "#fff"
-	const colText = "#001"
-	const colTimeline = "#000"
-	const colTimelineStrokeSecond = "#111"
-	const colTimelineStrokeHalf = "#333"
-	const colTimelineStroke100ms = "#555"
-	const colTimelineStrokeBudget = "#999"
-	const colBlockThrottle = "#777"
-	const colBlockFrame = "#e40"
-	const colBlockTick = "#0f3"
-	const colBlockTask = "#02e"
+	// https://coolors.co/palette/355070-6d597a-b56576-e56b6f-eaac8b
+	// https://coolors.co/palette/ff595e-ffca3a-8ac926-1982c4-6a4c93
+	const (
+		colBack                 = "#ffffff00" // "#fff"
+		colText                 = "#ef6351"   // "#001"
+		colTimeline             = "#6F5E53"   // "#000"
+		colTimelineStrokeSecond = "#AB947E"   // "#111"
+		colTimelineStrokeHalf   = "#8A7968"   // "#333"
+		colTimelineStroke100ms  = "#8A7968"   // "#555"
+		colTimelineStrokeBudget = "#593D3B"   // "#999"
+		colBlockThrottle        = "#666"      // "#777"
+		colBlockFrame           = "#FFCA3A"   // "#e40"
+		colBlockTick            = "#8AC926"   // "#0f3"
+		colBlockTask            = "#1982C4"   // "#02e"
+	)
 
-	// const
-	const widthPxPerSecond = float64(2000)
-	const widthPxPerMs = widthPxPerSecond / 1000
-	const sampleHeight = float64(50)
-	const mainPaddingX = float64(20)
-	const mainPaddingY = float64(40)
-	const timeLineMargin = float64(4)
-	const infoHeight = float64(15)
+	// rules
+	const (
+		widthPxPerSecond = float64(2000)
+		widthPxPerMs     = widthPxPerSecond / 1000
+		widthPxPerUs     = widthPxPerMs / 1000
+		sampleHeight     = float64(50)
+		mainPaddingX     = float64(20)
+		mainPaddingY     = float64(40)
+		timeLineMargin   = float64(15)
+		infoHeight       = float64(25)
+	)
 
 	// calculate graph size
 	lastStat := stats[len(stats)-1]
@@ -160,8 +282,8 @@ func testOutput(t *testing.T, e *Executor, variant testTraceVariant, measures []
 
 	// timeline strokes
 	drawStroke := func(interval time.Duration, color string, halfHeight float64, withText bool) {
-		curTime := time.Millisecond * 0
-		for x := mainPaddingX; x <= timelineWidth; x += float64(interval.Milliseconds()) * widthPxPerMs {
+		curTime := time.Microsecond * 0
+		for x := mainPaddingX; x <= timelineWidth; x += float64(interval.Microseconds()) * widthPxPerUs {
 			dc.SetHexColor(color)
 			dc.DrawLine(x, timelineY-halfHeight, x, timelineY+halfHeight)
 			if halfHeight >= 10 {
@@ -186,20 +308,33 @@ func testOutput(t *testing.T, e *Executor, variant testTraceVariant, measures []
 	drawStroke(lastStat.FrameTimeLimit, colTimelineStrokeBudget, 1, false)
 
 	// blocks
-
 	drawBlocks := func(samples []testMeasure, color string) {
-		for _, sample := range samples {
+		for ind, sample := range samples {
 			relativeStartAt := sample.startAt.Sub(lastStat.Execute.StartAt)
 			x := mainPaddingX + (float64(relativeStartAt.Milliseconds()) * widthPxPerMs)
+			y := timelineY - timeLineMargin - sampleHeight
 			width := float64(sample.endAt.Sub(sample.startAt).Milliseconds()) * widthPxPerMs
 
 			dc.SetHexColor(color)
-			dc.DrawRectangle(x, timelineY-timeLineMargin-sampleHeight, width, sampleHeight)
+			dc.DrawRectangle(x, y, width, sampleHeight)
 			dc.Fill()
+
+			blockStartHighlightHeight := float64(1)
+			dc.DrawRectangle(x, y-blockStartHighlightHeight, 1, sampleHeight+blockStartHighlightHeight)
+			dc.Fill()
+
+			if sample.bType == testTraceBlockFrame {
+				dc.SetHexColor(colText)
+				dc.DrawStringAnchored(fmt.Sprintf("%d", ind+1), x+(width/2), y-timeLineMargin, 0.5, 0)
+			}
 		}
 	}
 
 	tasks := transformToMeasure(stats, func(s Stats) *testMeasure {
+		if s.Tasks.Duration <= time.Microsecond*50 {
+			return nil
+		}
+
 		return &testMeasure{
 			bType:   testTraceBlockTask,
 			startAt: s.Tasks.StartAt,
