@@ -2,7 +2,7 @@
 
 Library for making endless game-loops, it`s heart of any game engine.
 
-![gameloop](./example/gameloop.png)
+![gameloop](example/gameloop.png)
 
 Game loop is endless loop:
 ```go
@@ -19,7 +19,7 @@ Each __cycle__ contains 4 different steps:
 
 ## Deterministic cycles
 
-Every update is deterministic, and deltaTime always fixed and same
+Every update is deterministic, and deltaTime always fixed and same -
 independent of hardware.
 
 You can make any game state updates in `Tick` function
@@ -31,10 +31,7 @@ Executor will run your `gameLoop` and automatic collect
 and calculate all frame stats, also it will be throttle
 processing, when CPU is more powerful than we need in `targetTPS`
 
-After each frame, it call `afterFrame` function with all
-frame stats, and most useful is frame `stats.DeltaTime`
-
-```
+```go
 package main
 
 import "github.com/fe3dback/glx-frames/frame"
@@ -67,7 +64,7 @@ Optionally stats collector can be used in `Executor`
 Stats collector is just a function `func(s Stats)`.
 This function will be executed right after each cycle end
 
-```
+```go
 frame.NewExecutor(
   frame.WithTargetTPS(60),
   frame.WithStatsCollector(func(stats frame.Stats) {
@@ -78,7 +75,7 @@ frame.NewExecutor(
 
 Stats object contain information about cycle execution and timings
 
-```
+```go
 type Stats struct {
   // CycleID is number of game loop cycles since game start (this will auto inc to +1 every loop)
   CycleID uint64
@@ -104,6 +101,10 @@ type Stats struct {
   CurrentFPS int // real counted frames per second
 }
 
+type Timings struct {
+  Start    time.Time
+  Duration time.Duration
+}
 ```
 
 ## Tasks
@@ -183,7 +184,7 @@ Color mapping:
 - blue = tasks
 - white = throttle (sleep)
 
-![trace](./example/trace/example.png)
+![trace](example/example.png)
 
 #### This test also in text profile
 

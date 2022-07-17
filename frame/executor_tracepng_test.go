@@ -3,7 +3,6 @@ package frame
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"path"
 	"testing"
 	"time"
@@ -74,19 +73,52 @@ func testTraceVariants() []testTraceVariant {
 			testDuration:         time.Second * 1,
 			targetTicksPerSecond: 60,
 
-			latencyTick:  time.Millisecond * 5,
-			latencyFrame: time.Millisecond * 9,
+			latencyTick:  time.Millisecond * 6,
+			latencyFrame: time.Millisecond * 3,
+		},
+		{
+			outputName:           "2_tick_lags_emulation",
+			testDuration:         time.Second * 1,
+			targetTicksPerSecond: 60,
 
-			additionalLogicFrame: func(frameID int) {
-				time.Sleep(time.Millisecond * time.Duration(rand.Float64()*33))
+			latencyTick:  time.Millisecond * 6,
+			latencyFrame: time.Millisecond * 3,
+
+			additionalLogicTick: func(tickID int) {
+				if tickID >= 10 && tickID <= 30 {
+					time.Sleep(time.Duration(tickID) * time.Millisecond)
+				}
 			},
+		},
+		{
+			outputName:           "3_frame_lags_emulation",
+			testDuration:         time.Second * 1,
+			targetTicksPerSecond: 60,
+
+			latencyTick:  time.Millisecond * 6,
+			latencyFrame: time.Millisecond * 3,
+
+			additionalLogicFrame: func(tickID int) {
+				if tickID >= 10 && tickID <= 30 {
+					time.Sleep(time.Duration(tickID) * time.Millisecond)
+				}
+			},
+		},
+		{
+			outputName:           "4_task_lags_emulation",
+			testDuration:         time.Second * 1,
+			targetTicksPerSecond: 60,
+
+			latencyTick:  time.Millisecond * 6,
+			latencyFrame: time.Millisecond * 3,
 
 			additionalTasks: []*Task{
 				NewTask(func() {
-					time.Sleep(time.Millisecond * 5)
+					time.Sleep(time.Millisecond * 100)
 				},
+					WithRunAtLeastOnceIn(time.Millisecond*500),
+					WithRunAtMostOnceIn(time.Second),
 					WithPriority(TaskPriorityHigh),
-					WithRunAtLeastOnceIn(time.Millisecond*100),
 				),
 			},
 		},
