@@ -42,7 +42,6 @@ func testMeasureFunction(bType testTraceBlockType, fn func()) testMeasure {
 
 type testTraceVariant struct {
 	outputName           string
-	outputDescriptionMd  string
 	testDuration         time.Duration
 	targetTicksPerSecond int
 	latencyTick          time.Duration
@@ -51,20 +50,27 @@ type testTraceVariant struct {
 	additionalLogicFrame func(frameID int)
 	additionalLogicTick  func(tickID int)
 	additionalTasks      []*Task
+
+	debugFrameTimings bool
 }
 
 func testTraceVariants() []testTraceVariant {
 	return []testTraceVariant{
 		{
-			outputName: "1_60tps",
-			outputDescriptionMd: `
-				Example of stable deterministic fixed-step simulation.
-				- Target TPS (ticks per second) = 30
-				- Update latency is 15ms
-				- Draw latency is 6ms
-				
-				This example emulates draw lag on frame #5 for 100ms
-			`,
+			outputName:           "example",
+			testDuration:         testExampleDuration,
+			targetTicksPerSecond: testExampleTicksRate,
+
+			latencyTick:  testExampleLatencyTick,
+			latencyFrame: testExampleLatencyFrame,
+
+			additionalTasks: []*Task{
+				testExampleTask1(testExampleLatencyTask),
+				testExampleTaskGC(),
+			},
+		},
+		{
+			outputName:           "1_60tps",
 			testDuration:         time.Second * 1,
 			targetTicksPerSecond: 60,
 
@@ -225,19 +231,21 @@ func TestTraceExecutor(t *testing.T) {
 
 		cancel()
 
-		for _, stat := range collectedStats {
-			fmt.Printf("%d.\n"+
-				"- tick start: %dus\n"+
-				"-   tick end: %dus\n"+
-				"-  frm start: %dus\n"+
-				"-    frm end: %dus\n",
+		if variant.debugFrameTimings {
+			for _, stat := range collectedStats {
+				fmt.Printf("%d.\n"+
+					"- tick start: %dus\n"+
+					"-   tick end: %dus\n"+
+					"-  frm start: %dus\n"+
+					"-    frm end: %dus\n",
 
-				stat.CycleID,
-				stat.Tick.Start.Sub(stat.Game.Start).Microseconds(),
-				(stat.Tick.Start.Sub(stat.Game.Start) + stat.Tick.Duration).Microseconds(),
-				stat.Frame.Start.Sub(stat.Game.Start).Microseconds(),
-				(stat.Frame.Start.Sub(stat.Game.Start) + stat.Tick.Duration).Microseconds(),
-			)
+					stat.CycleID,
+					stat.Tick.Start.Sub(stat.Game.Start).Microseconds(),
+					(stat.Tick.Start.Sub(stat.Game.Start) + stat.Tick.Duration).Microseconds(),
+					stat.Frame.Start.Sub(stat.Game.Start).Microseconds(),
+					(stat.Frame.Start.Sub(stat.Game.Start) + stat.Tick.Duration).Microseconds(),
+				)
+			}
 		}
 
 		testOutput(t, testExecutor, variant, measures, collectedStats)
